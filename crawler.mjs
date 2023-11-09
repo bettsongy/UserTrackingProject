@@ -1,34 +1,28 @@
-import puppeteer from 'puppeteer';
-
-(async () => {
-  // Launch the browser and open a new blank page
-  const browser = await puppeteer.launch();
-  const page = await browser.newPage();
-
-  // Navigate the page to a URL
-  // await page.goto('https://developer.chrome.com/');
-  await page.goto('https://developer.chrome.com/', { waitUntil: 'networkidle0' });
-
-
-  // Set screen size
-  await page.setViewport({width: 1080, height: 1024});
-
-  // Type into search box
-  await page.type('.search-box__input', 'automate');
-
-  // Wait and click on first result
-  const searchResultSelector = '.search-box__link';
-  await page.waitForSelector(searchResultSelector);
-  await page.click(searchResultSelector);
-
-  // Locate the full title with a unique string
-  const textSelector = await page.waitForSelector(
-    'text/Password'
-  );
-  const fullTitle = await textSelector?.evaluate(el => el.textContent);
-
-  // Print the full title
-  console.log('The title of this blog post is "%s".', fullTitle);
-
-  await browser.close();
-})();
+import puppeteer from 'puppeteer-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+import { env } from 'process';
+puppeteer.use(StealthPlugin());
+const browser = await puppeteer.launch({ headless: false });
+const page = await browser.newPage();
+await page.setExtraHTTPHeaders({
+    'accept-language': 'en-US,en;q=0.9,hy;q=0.8'
+});
+// await page.goto('https://medium.com/m/connect/google?state=google-%7Chttps%3A%2F%2Fmedium.com%2F');
+await page.goto('https://accounts.google.com/');
+await page.waitForSelector('input[type="email"]')
+await page.type('input[type="email"]', env.GUSER);
+await Promise.all([
+    page.waitForNavigation(),
+    await page.keyboard.press('Enter')
+]);
+await page.waitForSelector('input[type="password"]', { visible: true });
+await page.type('input[type="password"]', env.GPASS);
+const res = await Promise.all([
+    page.waitForFunction(() => location.href === 'https://medium.com/'),
+    await page.keyboard.press('Enter')
+]);
+// print user id
+await page.waitForFunction(() => window?.branch?.g);
+const myId = await page.evaluate(() => window.branch.g);
+console.log("myId:", myId);
+await browser.close();
