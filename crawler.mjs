@@ -2,6 +2,11 @@ import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import fs from 'fs/promises';
 import { env } from 'process';
+import { MongoClient } from 'mongodb';
+import dotenv from 'dotenv';
+dotenv.config();
+
+
 
 puppeteer.use(StealthPlugin());
 
@@ -32,6 +37,63 @@ async function readInterests(file) {
     return [];
   }
 }
+
+async function interceptRequests(page) {
+  const requestsData = [];
+  await page.setRequestInterception(true);
+
+  page.on('request', request => {
+  // Collect request data with a timestamp
+  requestsData.push({
+    url: request.url(),
+    method: request.method(),
+    headers: filterHeaders(request.headers()),
+    postData: request.postData(),
+    timestamp: new Date().toISOString(), // MongoDB-compatible date format
+  });
+  request.continue();
+});
+
+  page.on('response', async response => {
+    const request = response.request();
+    const status = response.status();
+    if (!status.toString().startsWith('3') && response.ok()) {
+      try {
+        if (!response.bodyUsed) {
+          const responseBody = await response.text();
+          // Push essential response details
+          requestsData.push({
+            url: request.url(),
+            status: status,
+            headers: filterHeaders(response.headers()),
+            postData: request.postData(), // Only if it's relevant
+            // responseBody: responseBody, // Be cautious with sensitive data
+          });
+        }
+      } catch (error) {
+        console.error(`Error reading response body for ${response.url()}: ${error}`);
+      }
+    }
+  });
+
+  return requestsData;
+}
+
+function filterHeaders(headers) {
+  // Define headers that are relevant for tracking
+  const relevantHeaders = ['cookie', 'set-cookie', 'authorization', 'x-client-data', 'referer'];
+  return Object.keys(headers)
+    .filter(key => relevantHeaders.includes(key.toLowerCase()))
+    .reduce((obj, key) => {
+      obj[key] = headers[key];
+      return obj;
+    }, {});
+}
+
+
+
+
+
 
 async function simulateUserActions(page, interests) {
   // Assume loginToGoogle() has been called earlier to log in
@@ -67,32 +129,54 @@ async function simulateUserActions(page, interests) {
     
   }
 
-  // Close the browser
-  await page.browser().close();
 }
+
 
 
 async function main() {
-  // Launch a browser and create a new page
-  const browser = await puppeteer.launch({ headless: false });
-  const page = await browser.newPage();
+  // Retrieve connection details from environment variables
+  const uri = process.env.MONGODB_URI;
+  const dbName = process.env.MONGODB_DB;
+  const collectionName = process.env.MONGODB_COLLECTION;
 
-  // Set extra HTTP headers
-  await page.setExtraHTTPHeaders({
-    'accept-language': 'en-US,en;q=0.9',
-  });
+  // Connect to MongoDB
+  const client = new MongoClient(uri, { useNewUrlParser: true, useUnifiedTopology: true });
 
-  // Log in to Google
-  await loginToGoogle(page);
+  try {
+    await client.connect();
+    console.log('Connected to MongoDB');
 
-  // Read interests from file
-  const interests = await readInterests('./interest-gamer.txt');
+    const db = client.db(dbName);
+    const collection = db.collection(collectionName);
 
-  // Simulate user actions with the page and interests
-  await simulateUserActions(page, interests);
+    const browser = await puppeteer.launch({ headless: false });
+    const page = await browser.newPage();
+    //... rest of your code for puppeteer
 
-  // Close the browser when done
-  await browser.close();
+    const networkData = await interceptRequests(page);
+    await loginToGoogle(page);
+
+    const interests = await readInterests('./interest-gamer.txt');
+    await simulateUserActions(page, interests);
+
+    // Insert network data into MongoDB
+    if (networkData.length > 0) {
+      const result = await collection.insertMany(networkData);
+      console.log(`${result.insertedCount} documents were inserted`);
+    } else {
+      console.log('No data to insert');
+    }
+
+    await browser.close();
+  } catch (error) {
+    console.error('An error occurred:', error);
+  } finally {
+    await client.close();
+    console.log('Disconnected from MongoDB');
+  }
 }
+
+
+
 
 main().catch(console.error);
