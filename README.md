@@ -61,3 +61,23 @@ node analyze.mjs
 
 # Generate the report
 node report.mjs
+
+
+
+
+
+
+# Activate the virtual environment on Unix or MacOS
+source venv/bin/activate
+
+# To run collect-unique-id.py 
+ python3 collect-unique-id.py 
+
+# Install packages in the virtual environment
+pip install pymongo pandas
+
+#quit the virtual env
+deactivate
+
+
+

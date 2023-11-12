@@ -10,6 +10,26 @@ dotenv.config();
 
 puppeteer.use(StealthPlugin());
 
+const CONCURRENCY_LIMIT = 5; // Limit of concurrent tabs/pages
+
+
+async function runCrawlingProcess(page, interest, cdpClient, requestsData) {
+  try {
+    await interceptRequestsAndResponses(page, cdpClient, requestsData);
+    await page.goto('https://www.google.com/', { waitUntil: 'networkidle2' });
+    await page.waitForSelector('textarea[name="q"]', { visible: true, timeout: 5000 });
+    await page.type('textarea[name="q"]', interest);
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'networkidle0' }),
+      page.keyboard.press('Enter'),
+    ]);
+    console.log(`Searched for: ${interest}`);
+  } catch (error) {
+    console.error(`Error with searching: ${interest}: ${error}`);
+  }
+}
+
+
 async function loginToGoogle(page) {
   await page.goto('https://accounts.google.com/');
   await page.waitForSelector('input[type="email"]');
@@ -132,15 +152,13 @@ async function simulateUserActions(page, interests) {
 }
 
 function parseSetCookieHeader(setCookieStr) {
-  // A simple parser to split the cookie string by ';' and extract attributes
   let attributes = setCookieStr.split(';').map(attr => attr.trim());
-  let cookieValue = attributes.shift(); // The first element is the cookie value
+  let cookieValue = attributes.shift();
   let cookieParts = cookieValue.split('=');
   let cookieObj = {
     name: cookieParts.shift(),
     value: cookieParts.join('='),
   };
-  // Extract other attributes like 'SameSite'
   attributes.forEach(attr => {
     let [key, value] = attr.split('=');
     cookieObj[key.trim().toLowerCase()] = value ? value.trim() : true;
@@ -149,81 +167,112 @@ function parseSetCookieHeader(setCookieStr) {
 }
 
 async function interceptRequestsAndResponses(page, client, requestsData) {
-  await client.send('Network.enable');
+    await client.send('Network.enable');
 
-  // Enhanced request interception
-  client.on('Network.requestWillBeSent', event => {
-    requestsData.push({
-      type: 'request',
-      url: event.request.url,
-      method: event.request.method,
-      headers: event.request.headers,
-      postData: event.request.postData,
-      timestamp: new Date(event.timestamp * 1000).toISOString(),
+    // Enhanced request interception
+    client.on('Network.requestWillBeSent', event => {
+        requestsData.push({
+            type: 'request',
+            url: event.request.url,
+            method: event.request.method,
+            headers: event.request.headers,
+            postData: event.request.postData,
+            timestamp: new Date(event.timestamp * 1000).toISOString(),
+        });
     });
-  });
 
-  client.on('Network.responseReceived', async event => {
-  try {
-    if (event.response.hasData) {
-      const response = await client.send('Network.getResponseBody', { requestId: event.requestId });
-      requestsData.push({
-        type: 'response',
-        url: event.response.url,
-        status: event.response.status,
-        headers: event.response.headers,
-        responseBody: response.body, // Be cautious with sensitive data
-        timestamp: new Date(event.timestamp * 1000).toISOString(),
-      });
-    }
-  } catch (error) {
-    console.error(`Error reading response body for ${event.response.url}: ${error}`);
-  }
-});
+    // Enhanced response interception
+    client.on('Network.responseReceived', async event => {
+        try {
+            let cookies = [];
+            const responseHeaders = event.response.headers;
+
+            // Check and parse 'set-cookie' headers if they are present
+            if (responseHeaders['set-cookie']) {
+                const setCookieHeaders = Array.isArray(responseHeaders['set-cookie'])
+                    ? responseHeaders['set-cookie']
+                    : [responseHeaders['set-cookie']];
+                
+                cookies = setCookieHeaders.map(header => parseSetCookieHeader(header));
+            }
+
+            let responseBody = '';
+            if (event.response.bodySize > 0) {
+                try {
+                    // Attempt to get the response body
+                    const response = await client.send('Network.getResponseBody', { requestId: event.requestId });
+                    responseBody = response.body;
+                } catch (e) {
+                    // If there's an error, response body will be left as an empty string
+                }
+            }
+
+            requestsData.push({
+                type: 'response',
+                url: event.response.url,
+                status: event.response.status,
+                headers: event.response.headers,
+                cookies: cookies,
+                responseBody: responseBody,
+                timestamp: new Date(event.timestamp * 1000).toISOString(),
+            });
+        } catch (error) {
+            console.error(`Error reading response for ${event.response.url}: ${error}`);
+        }
+    });
 }
 
 
-
 async function main() {
-  const uri = process.env.MONGODB_URI;
-  const dbName = process.env.MONGODB_DB;
-  const collectionName = process.env.MONGODB_COLLECTION;
+  // Load environment variables
+  const uri = env.MONGODB_URI;
+  const dbName = env.MONGODB_DB;
+  const collectionName = env.MONGODB_COLLECTION;
 
-  const client = new MongoClient(uri, { useNewUrlParser: true, useUnifiedTopology: true });
+  // Create MongoDB client and connect
+  const client = new MongoClient(uri);
   await client.connect();
   const db = client.db(dbName);
   const collection = db.collection(collectionName);
 
+  // Launch browser
   const browser = await puppeteer.launch({ headless: false });
-  const page = await browser.newPage();
-  const cdpClient = await page.target().createCDPSession();
 
-  const networkData = [];
-  await interceptRequestsAndResponses(page, cdpClient, networkData);
-
-  await loginToGoogle(page);
+  // Perform crawling while logged in
+  const pageLoggedIn = await browser.newPage();
+  await loginToGoogle(pageLoggedIn); // Perform login
   const interests = await readInterests('./interest-gamer.txt');
-  // Your existing code for simulateUserActions
+  const networkDataLoggedIn = [];
+  const cdpClientLoggedIn = await pageLoggedIn.target().createCDPSession();
+  await simulateUserActions(pageLoggedIn, interests, cdpClientLoggedIn, networkDataLoggedIn);
+  await cdpClientLoggedIn.send('Network.disable');
 
-  await simulateUserActions(page, interests);
-
-
-
-  await cdpClient.send('Network.disable'); // Stop network monitoring
-
-  // Insert network data into MongoDB
-  if (networkData.length > 0) {
-    const result = await collection.insertMany(networkData);
-    console.log(`${result.insertedCount} documents were inserted`);
+  // Store logged in data
+  if (networkDataLoggedIn.length > 0) {
+    const resultLoggedIn = await collection.insertMany(networkDataLoggedIn.map(data => ({ ...data, loggedIn: true })));
+    console.log(`Logged in data: ${resultLoggedIn.insertedCount} documents were inserted`);
   } else {
-    console.log('No data to insert');
+    console.log('No logged in data to insert');
   }
 
+  // Perform crawling without being logged in
+  const pageLoggedOut = await browser.newPage();
+  const networkDataLoggedOut = [];
+  const cdpClientLoggedOut = await pageLoggedOut.target().createCDPSession();
+  await simulateUserActions(pageLoggedOut, interests, cdpClientLoggedOut, networkDataLoggedOut);
+  await cdpClientLoggedOut.send('Network.disable');
+
+  // Store logged out data
+  if (networkDataLoggedOut.length > 0) {
+    const resultLoggedOut = await collection.insertMany(networkDataLoggedOut.map(data => ({ ...data, loggedIn: false })));
+    console.log(`Logged out data: ${resultLoggedOut.insertedCount} documents were inserted`);
+  } else {
+    console.log('No logged out data to insert');
+  }
+
+  // Clean up
   await browser.close();
   await client.close();
 }
-
-
-
 
 main().catch(console.error);
