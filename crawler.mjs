@@ -67,7 +67,7 @@ async function interceptRequests(page) {
             status: status,
             headers: filterHeaders(response.headers()),
             postData: request.postData(), // Only if it's relevant
-            // responseBody: responseBody, // Be cautious with sensitive data
+            responseBody: responseBody, // Be cautious with sensitive data
           });
         }
       } catch (error) {
@@ -131,49 +131,96 @@ async function simulateUserActions(page, interests) {
 
 }
 
+function parseSetCookieHeader(setCookieStr) {
+  // A simple parser to split the cookie string by ';' and extract attributes
+  let attributes = setCookieStr.split(';').map(attr => attr.trim());
+  let cookieValue = attributes.shift(); // The first element is the cookie value
+  let cookieParts = cookieValue.split('=');
+  let cookieObj = {
+    name: cookieParts.shift(),
+    value: cookieParts.join('='),
+  };
+  // Extract other attributes like 'SameSite'
+  attributes.forEach(attr => {
+    let [key, value] = attr.split('=');
+    cookieObj[key.trim().toLowerCase()] = value ? value.trim() : true;
+  });
+  return cookieObj;
+}
+
+async function interceptRequestsAndResponses(page, client, requestsData) {
+  await client.send('Network.enable');
+
+  // Enhanced request interception
+  client.on('Network.requestWillBeSent', event => {
+    requestsData.push({
+      type: 'request',
+      url: event.request.url,
+      method: event.request.method,
+      headers: event.request.headers,
+      postData: event.request.postData,
+      timestamp: new Date(event.timestamp * 1000).toISOString(),
+    });
+  });
+
+  client.on('Network.responseReceived', async event => {
+  try {
+    if (event.response.hasData) {
+      const response = await client.send('Network.getResponseBody', { requestId: event.requestId });
+      requestsData.push({
+        type: 'response',
+        url: event.response.url,
+        status: event.response.status,
+        headers: event.response.headers,
+        responseBody: response.body, // Be cautious with sensitive data
+        timestamp: new Date(event.timestamp * 1000).toISOString(),
+      });
+    }
+  } catch (error) {
+    console.error(`Error reading response body for ${event.response.url}: ${error}`);
+  }
+});
+}
+
 
 
 async function main() {
-  // Retrieve connection details from environment variables
   const uri = process.env.MONGODB_URI;
   const dbName = process.env.MONGODB_DB;
   const collectionName = process.env.MONGODB_COLLECTION;
 
-  // Connect to MongoDB
   const client = new MongoClient(uri, { useNewUrlParser: true, useUnifiedTopology: true });
+  await client.connect();
+  const db = client.db(dbName);
+  const collection = db.collection(collectionName);
 
-  try {
-    await client.connect();
-    console.log('Connected to MongoDB');
+  const browser = await puppeteer.launch({ headless: false });
+  const page = await browser.newPage();
+  const cdpClient = await page.target().createCDPSession();
 
-    const db = client.db(dbName);
-    const collection = db.collection(collectionName);
+  const networkData = [];
+  await interceptRequestsAndResponses(page, cdpClient, networkData);
 
-    const browser = await puppeteer.launch({ headless: false });
-    const page = await browser.newPage();
-    //... rest of your code for puppeteer
+  await loginToGoogle(page);
+  const interests = await readInterests('./interest-gamer.txt');
+  // Your existing code for simulateUserActions
 
-    const networkData = await interceptRequests(page);
-    await loginToGoogle(page);
+  await simulateUserActions(page, interests);
 
-    const interests = await readInterests('./interest-gamer.txt');
-    await simulateUserActions(page, interests);
 
-    // Insert network data into MongoDB
-    if (networkData.length > 0) {
-      const result = await collection.insertMany(networkData);
-      console.log(`${result.insertedCount} documents were inserted`);
-    } else {
-      console.log('No data to insert');
-    }
 
-    await browser.close();
-  } catch (error) {
-    console.error('An error occurred:', error);
-  } finally {
-    await client.close();
-    console.log('Disconnected from MongoDB');
+  await cdpClient.send('Network.disable'); // Stop network monitoring
+
+  // Insert network data into MongoDB
+  if (networkData.length > 0) {
+    const result = await collection.insertMany(networkData);
+    console.log(`${result.insertedCount} documents were inserted`);
+  } else {
+    console.log('No data to insert');
   }
+
+  await browser.close();
+  await client.close();
 }
 
 
