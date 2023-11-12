@@ -222,7 +222,6 @@ async function interceptRequestsAndResponses(page, client, requestsData) {
     });
 }
 
-
 async function main() {
   // Load environment variables
   const uri = env.MONGODB_URI;
@@ -237,40 +236,69 @@ async function main() {
 
   // Launch browser
   const browser = await puppeteer.launch({ headless: false });
-
-  // Perform crawling while logged in
-  const pageLoggedIn = await browser.newPage();
-  await loginToGoogle(pageLoggedIn); // Perform login
   const interests = await readInterests('./interest-gamer.txt');
   const networkDataLoggedIn = [];
-  const cdpClientLoggedIn = await pageLoggedIn.target().createCDPSession();
-  await simulateUserActions(pageLoggedIn, interests, cdpClientLoggedIn, networkDataLoggedIn);
-  await cdpClientLoggedIn.send('Network.disable');
-
-  // Store logged in data
-  if (networkDataLoggedIn.length > 0) {
-    const resultLoggedIn = await collection.insertMany(networkDataLoggedIn.map(data => ({ ...data, loggedIn: true })));
-    console.log(`Logged in data: ${resultLoggedIn.insertedCount} documents were inserted`);
-  } else {
-    console.log('No logged in data to insert');
-  }
-
-  // Perform crawling without being logged in
-  const pageLoggedOut = await browser.newPage();
   const networkDataLoggedOut = [];
-  const cdpClientLoggedOut = await pageLoggedOut.target().createCDPSession();
-  await simulateUserActions(pageLoggedOut, interests, cdpClientLoggedOut, networkDataLoggedOut);
-  await cdpClientLoggedOut.send('Network.disable');
 
-  // Store logged out data
-  if (networkDataLoggedOut.length > 0) {
-    const resultLoggedOut = await collection.insertMany(networkDataLoggedOut.map(data => ({ ...data, loggedIn: false })));
-    console.log(`Logged out data: ${resultLoggedOut.insertedCount} documents were inserted`);
-  } else {
-    console.log('No logged out data to insert');
+  // Create pages up to the concurrency limit
+  let pages = await Promise.all(
+    Array.from({ length: CONCURRENCY_LIMIT }, () => browser.newPage())
+  );
+
+  // Function to process a single interest search
+  const processInterest = async (page, interest, loggedIn) => {
+    try {
+      const cdpClient = await page.target().createCDPSession();
+      await runCrawlingProcess(page, interest, cdpClient, loggedIn ? networkDataLoggedIn : networkDataLoggedOut);
+      await cdpClient.detach(); // Detach the session
+    } catch (error) {
+      console.error(`Error processing interest: ${interest}`, error);
+    }
+  };
+
+  // Function to process a batch of interests
+  const processBatch = async (batch, loggedIn) => {
+    await Promise.all(batch.map((interest, index) => {
+      const pageIndex = index % CONCURRENCY_LIMIT;
+      const page = pages[pageIndex];
+      return processInterest(page, interest, loggedIn);
+    }));
+  };
+
+  // Process all interests while logged in
+  await loginToGoogle(pages[0]);
+  for (let i = 0; i < interests.length; i += CONCURRENCY_LIMIT) {
+    const batch = interests.slice(i, i + CONCURRENCY_LIMIT);
+    await processBatch(batch, true);
   }
+
+  // Process all interests while logged out
+  // Close and reopen pages to ensure no session data persists
+  await Promise.all(pages.map(page => page.close()));
+  pages = await Promise.all(
+    Array.from({ length: CONCURRENCY_LIMIT }, () => browser.newPage())
+  );
+
+  for (let i = 0; i < interests.length; i += CONCURRENCY_LIMIT) {
+    const batch = interests.slice(i, i + CONCURRENCY_LIMIT);
+    await processBatch(batch, false);
+  }
+
+  // Store the data in MongoDB
+  const insertData = async (data, loggedIn) => {
+    if (data.length > 0) {
+      const result = await collection.insertMany(data.map(entry => ({ ...entry, loggedIn })));
+      console.log(`Data for ${loggedIn ? 'logged in' : 'logged out'}: ${result.insertedCount} documents were inserted`);
+    } else {
+      console.log(`No data to insert for ${loggedIn ? 'logged in' : 'logged out'}`);
+    }
+  };
+
+  await insertData(networkDataLoggedIn, true);
+  await insertData(networkDataLoggedOut, false);
 
   // Clean up
+  await Promise.all(pages.map(page => page.close()));
   await browser.close();
   await client.close();
 }
