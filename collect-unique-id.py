@@ -1,9 +1,11 @@
 import re
 import pymongo
 import pandas as pd
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from dotenv import load_dotenv
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Load environment variables from .env file
 load_dotenv()
@@ -18,64 +20,79 @@ client = pymongo.MongoClient(MONGODB_URI)
 db = client[MONGODB_DB]
 collection = db[MONGODB_COLLECTION]
 
-# Regular expression to match UUIDs or similar unique identifiers
-uuid_pattern = re.compile(r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b')
+# Regular expression to match any string containing 'ID'
+id_pattern = re.compile(r'.*ID.*', re.IGNORECASE)
 
-# Function to search for unique IDs in a string
-def search_unique_ids(text):
-    return uuid_pattern.findall(str(text))
+# Function to search for and return entire strings containing 'ID'
+def search_id_strings(text):
+    return id_pattern.findall(str(text))
 
-# Initialize a dictionary to hold the count of each unique ID for all versions
-unique_id_counts_versions = {}
+# Initialize a dictionary to hold the count of each original string containing 'ID' for all versions
+id_counts_versions = {'logged_in': {}, 'logged_out': {}}
 
-# Check each document in the collection
-for document in collection.find():
+# Function to process a single document
+def process_document(document):
     version = 'logged_in' if document.get('loggedIn', False) else 'logged_out'
-    if version not in unique_id_counts_versions:
-        unique_id_counts_versions[version] = {}
-    unique_id_counts = unique_id_counts_versions[version]
-
-    # Check URL, headers, and POST data for unique IDs
+    id_counts = id_counts_versions[version]
+    
     components = [document.get('url', ''), str(document.get('headers', '')), document.get('postData', '')]
     for component in components:
-        if component:  # Check if the component is not None or empty
-            ids_found = search_unique_ids(component)
-            for uid in ids_found:
-                unique_id_counts[uid] = unique_id_counts.get(uid, 0) + 1
-
-# Threshold for occurrences
-threshold = 3
+        if component:
+            ids_found = search_id_strings(component)
+            for full_string in ids_found:
+                id_counts[full_string] = id_counts.get(full_string, 0) + 1
 
 # Function to create a DataFrame filtered by the threshold
-def create_filtered_df(unique_id_counts):
-    filtered_unique_ids = {uid: count for uid, count in unique_id_counts.items() if count >= threshold}
-    df_unique_ids = pd.DataFrame(list(filtered_unique_ids.items()), columns=['UniqueID', 'Count'])
-    return df_unique_ids.sort_values(by='Count', ascending=False)
+def create_filtered_df(id_counts):
+    filtered_ids = {full_string: count for full_string, count in id_counts.items() if count >= threshold}
+    df_ids = pd.DataFrame(list(filtered_ids.items()), columns=['IDString', 'Count'])
+    return df_ids.sort_values(by='Count', ascending=False)
 
-# Create DataFrames for all versions
-df_unique_ids_versions = {
-    version: create_filtered_df(unique_id_counts)
-    for version, unique_id_counts in unique_id_counts_versions.items()
-}
+# Concurrent processing of documents
+def run_concurrently():
+    with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+        futures = [executor.submit(process_document, doc) for doc in collection.find()]
+        for future in as_completed(futures):
+            future.result()  # We just need to wait for all futures to complete
 
-# Display the DataFrames
-for version, df in df_unique_ids_versions.items():
-    print(f"{version.capitalize()}:")
-    print(df)
-    print()
+# Main execution
+if __name__ == "__main__":
+    run_concurrently()
 
-# Data Visualization with Threshold for all versions
-fig, axes = plt.subplots(nrows=1, ncols=len(df_unique_ids_versions), figsize=(20, 8))
+    # Create DataFrames for all versions
+    df_id_versions = {
+        version: create_filtered_df(id_counts)
+        for version, id_counts in id_counts_versions.items()
+    }
 
-for ax, (version, df) in zip(axes, df_unique_ids_versions.items()):
-    ax.bar(df['UniqueID'], df['Count'], color='skyblue')
-    ax.set_title(version.capitalize())
-    ax.set_xlabel('Unique IDs')
-    ax.set_ylabel('Occurrences')
-    ax.grid(axis='y')
-    ax.tick_params(labelrotation=90)
+    # Create subplots: one for 'logged_in' and another for 'logged_out'
+    fig = make_subplots(rows=2, cols=1, subplot_titles=(
+        "Logged In - Occurrences of Original Strings Containing 'ID'",
+        "Logged Out - Occurrences of Original Strings Containing 'ID'"
+    ))
 
-# Adjust layout and display
-plt.suptitle(f'Occurrences of Unique IDs (Threshold: {threshold})')
-plt.tight_layout(rect=[0, 0.03, 1, 0.95])  # Adjust the plot to ensure everything fits without overlap
-plt.show()
+    # Generate Plotly interactive bar charts for 'logged_in'
+    fig.add_trace(
+        go.Bar(x=df_id_versions['logged_in']['IDString'], y=df_id_versions['logged_in']['Count'],
+               hoverinfo='x+y', name='Logged In'),
+        row=1, col=1
+    )
+
+    # Generate Plotly interactive bar charts for 'logged_out'
+    fig.add_trace(
+        go.Bar(x=df_id_versions['logged_out']['IDString'], y=df_id_versions['logged_out']['Count'],
+               hoverinfo='x+y', name='Logged Out'),
+        row=2, col=1
+    )
+
+    # Update layout to hide the x-axis tick labels
+    fig.update_layout(
+        xaxis=dict(showticklabels=False),
+        xaxis2=dict(showticklabels=False),
+        yaxis_title="Occurrences",
+        yaxis2_title="Occurrences",
+        showlegend=False,
+        height=1200  # Adjust height to ensure both plots are visible without scrolling
+    )
+
+    fig.show()
