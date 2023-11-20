@@ -15,15 +15,6 @@ function getDomainFromUrl(url) {
   return hostname.replace('www.', ''); // Remove 'www.' for consistency
 }
 
-
-
-
-
-
-
-
-
-
 async function insertData(collection, data) {
     if (data.length > 0) {
         const result = await collection.insertMany(data);
@@ -35,24 +26,21 @@ async function insertData(collection, data) {
 
 async function runCrawlingProcess(page, interest, loggedIn, cdpClient, requestsData, userInterest) {
     try {
-        await interceptRequestsAndResponses(page, cdpClient, requestsData, loggedIn, userInterest);
+        // Determine userType based on loggedIn status
+        const userType = loggedIn ? userInterest : `${userInterest}-guest`;
+         console.log(`userType in runCrawlingProcess: ${userType}`);
+        await interceptRequestsAndResponses(page, cdpClient, requestsData, userType);
         await page.goto('https://www.google.com/', { waitUntil: 'networkidle2' });
 
-        // Use textarea for Google's search field
         const searchTextareaSelector = 'textarea[name="q"]';
-
-        try {
-            await page.waitForSelector(searchTextareaSelector, { visible: true, timeout: 5000 });
-            await page.type(searchTextareaSelector, interest);
-        } catch (error) {
-            console.error(`Error finding search field using selector ${searchTextareaSelector}: ${error}`);
-            throw new Error('Google search field not found');
-        }
-
+        await page.waitForSelector(searchTextareaSelector, { visible: true, timeout: 3000 });
+        await page.type(searchTextareaSelector, interest);
+        
         await Promise.all([
-            page.waitForNavigation({ waitUntil: 'networkidle0' }),
+            page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 5000 }),
             page.keyboard.press('Enter'),
         ]);
+
         console.log(`Searched for: ${interest}`);
     } catch (error) {
         console.error(`Error with searching: ${interest}: ${error}`);
@@ -140,28 +128,29 @@ function filterHeaders(headers) {
     }, {});
 }
 
-async function processBatch(pages, batch, loggedIn) {
+async function processBatch(pages, batch, loggedIn, userInterest) {
     const promises = [];
-
     for (let i = 0; i < batch.length; i++) {
         const interest = batch[i];
         const pageIndex = i % CONCURRENCY_LIMIT;
         const page = pages[pageIndex];
-
         const promise = (async () => {
             const cdpClient = await page.target().createCDPSession();
             const requestsData = [];
-            await runCrawlingProcess(page, interest, loggedIn, cdpClient, requestsData, interest);
+            
+            await runCrawlingProcess(page, interest, loggedIn, cdpClient, requestsData, userInterest);
             await cdpClient.detach();
             return requestsData;
         })();
-
         promises.push(promise);
     }
 
-    const results = await Promise.all(promises);
-    return results.flat();
+    const allResults = await Promise.all(promises);
+    return allResults.flat();
 }
+
+
+
 
 
 
@@ -178,7 +167,7 @@ async function simulateUserActions(page, interests) {
       
     } catch (error) {
       console.error(`Search input not found: ${error}`);
-      await page.screenshot({ path: 'error-screenshot.png' }); // Take a screenshot for debugging
+      // await page.screenshot({ path: 'error-screenshot.png' }); // Take a screenshot for debugging
       throw new Error('Search input not found, aborting.');
     }
 
@@ -216,22 +205,19 @@ function parseSetCookieHeader(setCookieStr) {
   return cookieObj;
 }
 
-async function interceptRequestsAndResponses(page, client, requestsData, loggedIn, userInterest) {
+async function interceptRequestsAndResponses(page, client, requestsData, userType) {
     await client.send('Network.enable');
 
     client.on('Network.requestWillBeSent', event => {
         requestsData.push({
-            sessionInfo: {
-                loggedIn: loggedIn,
-                userInterest: userInterest,
-                website: getDomainFromUrl(event.request.url),
-            },
+            website: getDomainFromUrl(event.request.url),
+            userType: userType,
             type: 'request',
             url: event.request.url,
             method: event.request.method,
             headers: event.request.headers,
-            postData: event.request.postData,
-            timestamp: new Date().toISOString(), // Current timestamp
+            postData: event.request.postData || null,
+            timestamp: new Date(Date.now()).toISOString()
         });
     });
 
@@ -244,7 +230,6 @@ async function interceptRequestsAndResponses(page, client, requestsData, loggedI
                 const setCookieHeaders = Array.isArray(responseHeaders['set-cookie'])
                     ? responseHeaders['set-cookie']
                     : [responseHeaders['set-cookie']];
-                
                 cookies = setCookieHeaders.map(header => parseSetCookieHeader(header));
             }
 
@@ -259,18 +244,15 @@ async function interceptRequestsAndResponses(page, client, requestsData, loggedI
             }
 
             requestsData.push({
-                sessionInfo: {
-                    loggedIn: loggedIn,
-                    userInterest: userInterest,
-                    website: getDomainFromUrl(event.response.url),
-                },
+                website: getDomainFromUrl(event.response.url),
+                userType: userType,
                 type: 'response',
                 url: event.response.url,
                 status: event.response.status,
                 headers: event.response.headers,
                 cookies: cookies,
                 responseBody: responseBody,
-                timestamp: new Date().toISOString(), // Current timestamp
+                timestamp: new Date(Date.now()).toISOString()
             });
         } catch (error) {
             console.error(`Error reading response for ${event.response.url}: ${error}`);
@@ -294,8 +276,11 @@ async function main() {
 
      // Launch browser
     const browser = await puppeteer.launch({ headless: false });
-    const interests = await readInterests('./interest-gamer.txt');
+    const fileName = './interest-purse-lover.txt'
+    const interests = await readInterests(fileName);
+    const userType = fileName.split('/')[1].split('.')[0].split('interest-')[1]; // Extracts "purse-lover"
 
+    console.log(userType)
     // Create pages up to the concurrency limit
     let pages = await Promise.all(
         Array.from({ length: CONCURRENCY_LIMIT }, () => browser.newPage())
@@ -305,7 +290,7 @@ async function main() {
     await loginToGoogle(pages[0]);
     for (let i = 0; i < interests.length; i += CONCURRENCY_LIMIT) {
         const batch = interests.slice(i, i + CONCURRENCY_LIMIT);
-        const networkDataLoggedIn = await processBatch(pages, batch, true);
+        const networkDataLoggedIn = await processBatch(pages, batch, true, userType);
         await insertData(collection, networkDataLoggedIn);
     }
 
@@ -317,7 +302,7 @@ async function main() {
 
     for (let i = 0; i < interests.length; i += CONCURRENCY_LIMIT) {
         const batch = interests.slice(i, i + CONCURRENCY_LIMIT);
-        const networkDataLoggedOut = await processBatch(pages, batch, false);
+        const networkDataLoggedOut = await processBatch(pages, batch, false, userType);
         await insertData(collection, networkDataLoggedOut);
     }
 
