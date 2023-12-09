@@ -33,11 +33,11 @@ async function runCrawlingProcess(page, interest, loggedIn, cdpClient, requestsD
         await page.goto('https://www.google.com/', { waitUntil: 'networkidle2' });
 
         const searchTextareaSelector = 'textarea[name="q"]';
-        await page.waitForSelector(searchTextareaSelector, { visible: true, timeout: 3000 });
+        await page.waitForSelector(searchTextareaSelector, { visible: true, timeout: 10000 });
         await page.type(searchTextareaSelector, interest);
         
         await Promise.all([
-            page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 5000 }),
+            page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 10000 }),
             page.keyboard.press('Enter'),
         ]);
 
@@ -51,7 +51,7 @@ async function runCrawlingProcess(page, interest, loggedIn, cdpClient, requestsD
 async function loginToGoogle(page) {
   await page.goto('https://accounts.google.com/');
   await page.waitForSelector('input[type="email"]');
-  await page.type('input[type="email"]', env.GUSER);
+  await page.type('input[type="email"]', env.GUSER2);
 
 
   await Promise.all([
@@ -59,7 +59,7 @@ async function loginToGoogle(page) {
     page.keyboard.press('Enter'),
   ]);
   await page.waitForSelector('input[type="password"]', { visible: true });
-  await page.type('input[type="password"]', env.GPASS);
+  await page.type('input[type="password"]', env.GPASS2);
   await Promise.all([
     page.waitForNavigation(),
     page.keyboard.press('Enter'),
@@ -163,7 +163,7 @@ async function simulateUserActions(page, interests) {
 
     // Check if the search input is available
     try {
-      await page.waitForSelector('textarea[name="q"]', { visible: true, timeout: 5000 });
+      await page.waitForSelector('textarea[name="q"]', { visible: true, timeout: 10000 });
       
     } catch (error) {
       console.error(`Search input not found: ${error}`);
@@ -265,7 +265,7 @@ async function interceptRequestsAndResponses(page, client, requestsData, userTyp
 async function main() {
   // Load environment variables
   const uri = env.MONGODB_URI;
-  const dbName = env.MONGODB_DB;
+  const dbName = env.MONGODB_DB2;
   const collectionName = env.MONGODB_COLLECTION;
 
   // Create MongoDB client and connect
@@ -276,7 +276,7 @@ async function main() {
 
      // Launch browser
     const browser = await puppeteer.launch({ headless: false });
-    const fileName = './interest-purse-lover.txt'
+    const fileName = './interest-gamer.txt'
     const interests = await readInterests(fileName);
     const userType = fileName.split('/')[1].split('.')[0].split('interest-')[1]; // Extracts "purse-lover"
 

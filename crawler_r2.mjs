@@ -1,0 +1,334 @@
+import puppeteer from 'puppeteer-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+import fs from 'fs/promises';
+import { env } from 'process';
+import { MongoClient } from 'mongodb';
+import dotenv from 'dotenv';
+dotenv.config();
+
+puppeteer.use(StealthPlugin());
+
+const CONCURRENCY_LIMIT = 20; // Limit of concurrent tabs/pages
+
+function getDomainFromUrl(url) {
+  const hostname = new URL(url).hostname;
+  return hostname.replace('www.', ''); // Remove 'www.' for consistency
+}
+
+async function insertData(collection, data) {
+    if (data.length > 0) {
+        const result = await collection.insertMany(data);
+        console.log(`Data inserted: ${result.insertedCount} documents`);
+    } else {
+        console.log('No data to insert');
+    }
+}
+
+async function runCrawlingProcess(page, interest,cdpClient, requestsData, userInterest) {
+    try {
+        // Determine userType based on loggedIn status
+        const userType = userInterest;
+         
+        await interceptRequestsAndResponses(page, cdpClient, requestsData, userType);
+        await page.goto('https://www.google.com/', { waitUntil: 'networkidle2' });
+
+        const searchTextareaSelector = 'textarea[name="q"]';
+        await page.waitForSelector(searchTextareaSelector, { visible: true, timeout: 3000 });
+        await page.type(searchTextareaSelector, interest);
+        
+        await Promise.all([
+            page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 5000 }),
+            page.keyboard.press('Enter'),
+        ]);
+
+        console.log(`Searched for: ${interest}`);
+    } catch (error) {
+        console.error(`Error with searching: ${interest}: ${error}`);
+    }
+}
+
+
+async function loginToGoogle(page, username, password) {
+  await new Promise(resolve => setTimeout(resolve, 1000)); // Wait for 1 second
+  await page.goto('https://accounts.google.com/');
+  await page.waitForSelector('input[type="email"]');
+  await page.type('input[type="email"]', username);
+
+  await Promise.all([
+    page.waitForNavigation(),
+    page.keyboard.press('Enter'),
+  ]);
+  await page.waitForSelector('input[type="password"]', { visible: true });
+  await page.type('input[type="password"]', password);
+
+  await Promise.all([
+    page.waitForNavigation(),
+    page.keyboard.press('Enter'),
+  ]);
+}
+
+
+
+async function readInterests(file) {
+  try {
+    const data = await fs.readFile(file, 'utf8');
+    return data.split('\n').filter(Boolean);
+  } catch (err) {
+    console.error(`Error reading file from disk: ${err}`);
+    return [];
+  }
+}
+
+async function interceptRequests(page) {
+  const requestsData = [];
+  await page.setRequestInterception(true);
+
+  page.on('request', request => {
+  // Collect request data with a timestamp
+  requestsData.push({
+    url: request.url(),
+    method: request.method(),
+    headers: filterHeaders(request.headers()),
+    postData: request.postData(),
+    timestamp: new Date().toISOString(), // MongoDB-compatible date format
+  });
+  request.continue();
+});
+
+  page.on('response', async response => {
+    const request = response.request();
+    const status = response.status();
+    if (!status.toString().startsWith('3') && response.ok()) {
+      try {
+        if (!response.bodyUsed) {
+          const responseBody = await response.text();
+          // Push essential response details
+          requestsData.push({
+            url: request.url(),
+            status: status,
+            headers: filterHeaders(response.headers()),
+            postData: request.postData(), // Only if it's relevant
+            responseBody: responseBody, // Be cautious with sensitive data
+          });
+        }
+      } catch (error) {
+        console.error(`Error reading response body for ${response.url()}: ${error}`);
+      }
+    }
+  });
+
+  return requestsData;
+}
+
+function filterHeaders(headers) {
+  // Define headers that are relevant for tracking
+  const relevantHeaders = ['cookie', 'set-cookie', 'authorization', 'x-client-data', 'referer'];
+  return Object.keys(headers)
+    .filter(key => relevantHeaders.includes(key.toLowerCase()))
+    .reduce((obj, key) => {
+      obj[key] = headers[key];
+      return obj;
+    }, {});
+}
+
+async function processBatch(pages, batch, userInterest) {
+    console.log(`userInterest in processBatch: ${userInterest}`);
+    const promises = [];
+    for (let i = 0; i < batch.length; i++) {
+        const interest = batch[i];
+        const pageIndex = i % CONCURRENCY_LIMIT;
+        const page = pages[pageIndex];
+        const promise = (async () => {
+            const cdpClient = await page.target().createCDPSession();
+            const requestsData = [];
+            
+            // Ensure userInterest is correctly passed here
+            await runCrawlingProcess(page, interest, cdpClient, requestsData, userInterest);
+            await cdpClient.detach();
+            return requestsData;
+        })();
+        promises.push(promise);
+    }
+
+    const allResults = await Promise.all(promises);
+    return allResults.flat();
+}
+
+
+
+
+
+
+
+async function simulateUserActions(page, interests) {
+  // Assume loginToGoogle() has been called earlier to log in
+
+  for (const interest of interests) {
+    // Navigate to Google's homepage
+    await page.goto('https://www.google.com/', { waitUntil: 'networkidle2' });
+
+    // Check if the search input is available
+    try {
+      await page.waitForSelector('textarea[name="q"]', { visible: true, timeout: 5000 });
+      
+    } catch (error) {
+      console.error(`Search input not found: ${error}`);
+      // await page.screenshot({ path: 'error-screenshot.png' }); // Take a screenshot for debugging
+      throw new Error('Search input not found, aborting.');
+    }
+
+    // Type the interest into the search box
+    await page.type('textarea[name="q"]', interest);
+
+    // Wait for results page to load after submitting the search
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'networkidle0' }),
+      page.keyboard.press('Enter'),
+    ]);
+
+    // Log the search
+    console.log(`Searched for: ${interest}`);
+
+    // Clear the input
+    await page.evaluate(() => document.querySelector('textarea[name="q"]').value = '');
+    
+  }
+
+}
+
+function parseSetCookieHeader(setCookieStr) {
+  let attributes = setCookieStr.split(';').map(attr => attr.trim());
+  let cookieValue = attributes.shift();
+  let cookieParts = cookieValue.split('=');
+  let cookieObj = {
+    name: cookieParts.shift(),
+    value: cookieParts.join('='),
+  };
+  attributes.forEach(attr => {
+    let [key, value] = attr.split('=');
+    cookieObj[key.trim().toLowerCase()] = value ? value.trim() : true;
+  });
+  return cookieObj;
+}
+
+async function interceptRequestsAndResponses(page, client, requestsData, userType) {
+    await client.send('Network.enable');
+
+    client.on('Network.requestWillBeSent', event => {
+        requestsData.push({
+            website: getDomainFromUrl(event.request.url),
+            userType: userType,
+            type: 'request',
+            url: event.request.url,
+            method: event.request.method,
+            headers: event.request.headers,
+            postData: event.request.postData || null,
+            timestamp: new Date(Date.now()).toISOString()
+        });
+    });
+
+    client.on('Network.responseReceived', async event => {
+        try {
+            let cookies = [];
+            const responseHeaders = event.response.headers;
+
+            if (responseHeaders['set-cookie']) {
+                const setCookieHeaders = Array.isArray(responseHeaders['set-cookie'])
+                    ? responseHeaders['set-cookie']
+                    : [responseHeaders['set-cookie']];
+                cookies = setCookieHeaders.map(header => parseSetCookieHeader(header));
+            }
+
+            let responseBody = '';
+            if (event.response.bodySize > 0 && !event.response.headers['content-encoding']) {
+                try {
+                    const response = await client.send('Network.getResponseBody', { requestId: event.requestId });
+                    responseBody = response.body;
+                } catch (e) {
+                    console.error(`Error getting response body for ${event.response.url}: ${e}`);
+                }
+            }
+
+            requestsData.push({
+                website: getDomainFromUrl(event.response.url),
+                userType: userType,
+                type: 'response',
+                url: event.response.url,
+                status: event.response.status,
+                headers: event.response.headers,
+                cookies: cookies,
+                responseBody: responseBody,
+                timestamp: new Date(Date.now()).toISOString()
+            });
+        } catch (error) {
+            console.error(`Error reading response for ${event.response.url}: ${error}`);
+        }
+    });
+}
+
+// Update processAndStoreInterests to handle userInterest correctly
+async function processAndStoreInterests(pages, interests, userInterest, collection) {
+    // Debugging
+    console.log(`Processing interests for: ${userInterest}`);
+
+    for (let i = 0; i < interests.length; i += CONCURRENCY_LIMIT) {
+        const batch = interests.slice(i, i + CONCURRENCY_LIMIT);
+        const networkData = await processBatch(pages, batch, userInterest);
+        await insertData(collection, networkData);
+    }
+}
+
+// New function to reset pages
+async function resetPages(pages, browser) {
+  await Promise.all(pages.map(page => page.close()));
+  pages = await Promise.all(
+      Array.from({ length: CONCURRENCY_LIMIT }, () => browser.newPage())
+  );
+}
+
+async function main() {
+  // Load environment variables
+  const uri = env.MONGODB_URI;
+  const dbName = env.MONGODB_DB2;
+  const collectionName = env.MONGODB_COLLECTION;
+
+  // Create MongoDB client and connect
+  const client = new MongoClient(uri);
+  await client.connect();
+  const db = client.db(dbName);
+  const collection = db.collection(collectionName);
+
+  // Define user types and interests
+  const purseLoverInterests = await readInterests('./interest-purse-lover.txt');
+  const gamerInterests = await readInterests('./interest-gamer.txt');
+
+  // Process for first user (purse-lover)
+  let browser = await puppeteer.launch({ headless: false });
+  let pages = await Promise.all(
+    Array.from({ length: CONCURRENCY_LIMIT }, () => browser.newPage())
+  );
+
+  await loginToGoogle(pages[0], env.GUSER, env.GPASS);
+  await processAndStoreInterests(pages, purseLoverInterests, 'purse-lover', collection);
+
+  // Clean up after first user
+  await Promise.all(pages.map(page => page.close()));
+  await browser.close();
+
+  // Process for second user (gamer)
+  browser = await puppeteer.launch({ headless: false });
+  pages = await Promise.all(
+    Array.from({ length: CONCURRENCY_LIMIT }, () => browser.newPage())
+  );
+
+  await loginToGoogle(pages[0], env.GUSER2, env.GPASS2);
+  await processAndStoreInterests(pages, gamerInterests, 'gamer', collection);
+
+  // Final clean up
+  await Promise.all(pages.map(page => page.close()));
+  await browser.close();
+  await client.close();
+}
+
+main().catch(console.error);
+
